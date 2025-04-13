@@ -1,0 +1,1 @@
+std::result::Result<std::sync::MutexGuard<'_, u32>, PoisonError<std::sync::MutexGuard<'_, u32>>>

@@ -1,0 +1,1 @@
+std::result::Result<BenchmarkRunner, Box<dyn StdError + Send + Sync>>
