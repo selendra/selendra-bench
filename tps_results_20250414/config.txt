@@ -1,0 +1,10 @@
+TPS Test Configuration
+Node URL: wss://rpcx.selendra.org
+Backup URL: wss://rpc.selendra.org
+Duration per test: 180 seconds
+Accounts: 5
+Amount range: 1000000 to 5000000
+Starting TPS: 1
+Maximum TPS: 15
+TPS increment step: 2
+Test started at: Mon Apr 14 10:04:48 AM +07 2025

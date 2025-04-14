@@ -19,6 +19,7 @@ tps_test_results/
 
 # Transaction script files
 tx_scripts/
+test_output.json
 
 # Logs
 *.log
