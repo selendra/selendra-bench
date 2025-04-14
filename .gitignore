@@ -1,0 +1,51 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node.js related files (for real transaction scripts)
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TPS test outputs
+tps_test_results/
+*_test_results/
+*.json
+
+# Transaction script files
+tx_scripts/
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+.env.test
+.env.production
+
+# Editor/IDE specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.tmp
+*.old
+
+# Other binary files
+*.bin
+*.dat
+

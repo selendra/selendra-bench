@@ -28,6 +28,7 @@ pub struct BenchmarkStats {
     pub errors: HashMap<String, usize>,
     #[serde(skip)]
     pub node_metrics: Vec<NodeMetrics>,
+    pub transaction_statuses: Vec<TransactionStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,12 +99,11 @@ pub struct ChainMetadata {
     pub token_symbol: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TransactionStatus {
     pub tx_hash: String,
     pub block_number: Option<u32>,
-    pub finalized: bool,
-    pub error: Option<String>,
+    pub status: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

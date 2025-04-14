@@ -28,6 +28,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .required(true),
         )
         .arg(
+            Arg::new("backup-url")
+                .long("backup-url")
+                .value_name("URL")
+                .help("Backup WebSocket URL of the Selendra node")
+                .required(false),
+        )
+        .arg(
             Arg::new("accounts")
                 .long("accounts")
                 .value_name("NUM")
@@ -92,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .get_matches();
 
     let node_url = matches.get_one::<String>("node-url").unwrap();
+    let backup_url = matches.get_one::<String>("backup-url").cloned();
     let num_accounts = matches
         .get_one::<String>("accounts")
         .unwrap()
@@ -132,6 +140,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Selendra Network Enhanced Benchmarking Tool v0.2.0");
     println!("=================================================");
     println!("Node URL: {}", node_url);
+    println!("Backup URL: {:?}", backup_url);
     println!("Number of accounts: {}", num_accounts);
     println!("Transaction type: {:?}", tx_type);
     println!("Target TPS: {}", target_tps);
@@ -147,8 +156,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!();
 
     // Create and run benchmark
-    let runner = BenchmarkRunner::new(
+    let mut runner = BenchmarkRunner::new(
         node_url, 
+        backup_url,
         num_accounts, 
         tx_type, 
         target_tps, 
