@@ -13,12 +13,12 @@ yarn-error.log*
 benchmark_results
 
 # TPS test outputs
-tps_test_results/
-*_test_results/
+tps_test_results
+*_test_results
 *.json
 
 # Transaction script files
-tx_scripts/
+tx_scripts
 test_output.json
 tps_results_20250414
 
