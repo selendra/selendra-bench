@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex};
 use hex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct BenchmarkRunner {
@@ -77,327 +78,382 @@ impl BenchmarkRunner {
         })
     }
 
-    pub async fn run(&mut self) -> Result<BenchmarkStats, Box<dyn Error + Send + Sync>> {
-        println!("Getting chain metadata...");
-        let _ = self.node_client.get_chain_metadata().await;
-
-        println!("Starting transaction submission...");
-
-        // Create a channel for transaction status updates
-        let (tx_sender, tx_receiver) = mpsc::channel::<TransactionStatus>(100);
+    pub async fn run(&mut self) -> BenchmarkStats {
+        println!("Starting benchmark with {} accounts, TPS target: {}, Duration: {}s",
+                 self.accounts.len(), self.target_tps, self.duration);
+                 
+        let start_time = std::time::Instant::now();
+        let end_time = start_time + std::time::Duration::from_secs(self.duration);
         
-        // Add a buffer time after all transactions are submitted
-        let wait_after_completion = 120; // seconds
-        let total_wait_time = self.duration + wait_after_completion;
-        
-        println!("Waiting for transaction status updates for up to {} seconds...", total_wait_time);
-        
-        // Calculate the number of transactions to submit
-        let total_transactions = self.target_tps as u64 * self.duration;
-        println!("Will submit {} transactions over {} seconds", total_transactions, self.duration);
-        
-        // Determine max concurrent submissions based on whether real transactions are used
-        let max_concurrent_submissions = if self.use_real_transactions {
-            // For real transactions, limit concurrency to prevent overloading the node
-            if self.target_tps <= 1 {
-                1 // For very low TPS, just do one at a time
-            } else if self.target_tps <= 5 {
-                2 // For low TPS, allow two concurrent submissions
-            } else {
-                3 // For higher TPS, allow more concurrent submissions
-            }
-        } else {
-            // For simulated transactions, allow more concurrency
-            10
-        };
-        
-        // Keep track of in-flight transactions and status
-        let mut in_flight_count = 0;
-        let mut transactions_submitted = 0;
-        let transactions_completed = 0;
-        let mut transactions_failed = 0;
-        let mut last_reconnect_time = Instant::now();
-        let mut last_status_print_time = Instant::now();
-        
-        // Start the transaction processing loop
-        let start_time = Instant::now();
-        let mut next_tx_time = start_time;
-        let tx_interval = if total_transactions > 0 {
-            Duration::from_secs_f64(self.duration as f64 / total_transactions as f64)
-        } else {
-            Duration::from_secs(1)
-        };
-        
-        // Process transaction status updates from the channel
-        let mut final_stats = BenchmarkStats::default();
-        final_stats.transaction_statuses = Vec::new();
-        
-        // Create a separate task to collect transaction statuses
-        let status_collector_handle = {
-            let mut tx_receiver = tx_receiver;
-            let total_wait_time = total_wait_time;
+        // Create a channel for transaction status updates - use larger buffer
+        let (tx_sender, mut tx_receiver) = 
+            tokio::sync::mpsc::channel::<(String, TransactionStatus)>(2000);
             
-            tokio::spawn(async move {
-                let mut collected_stats = BenchmarkStats::default();
-                collected_stats.transaction_statuses = Vec::new();
-                let start_time = Instant::now();
+        // Track submitted transactions and their timestamps
+        let mut submitted_txs: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut confirmed_txs: HashMap<String, u32> = HashMap::new();
+        let mut errored_txs: HashMap<String, String> = HashMap::new();
+        
+        // Adaptive parameters
+        let mut max_wait_time = std::time::Duration::from_secs(180); // 3 minutes
+        let timeout_per_tx = std::time::Duration::from_secs(60); // 1 minute
+        let mut max_concurrent = 5;
+        
+        // Current state
+        let mut in_flight_count = 0;
+        let mut last_status_time = std::time::Instant::now();
+        let mut total_submitted = 0;
+        let mut reconnect_attempts = 0;
+        let max_reconnect_attempts = 3;
+        
+        // Setup a separate task for status checking
+        let node_client_clone = self.node_client.clone();
+        let check_status_handle = tokio::spawn(async move {
+            let mut check_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut tx_hashes: Vec<String> = Vec::new();
+            let mut tx_status: HashMap<String, Option<u32>> = HashMap::new();
+            
+            loop {
+                check_interval.tick().await;
                 
-                while let Some(tx_status) = tx_receiver.recv().await {
-                    // Add transaction status to statistics
-                    collected_stats.transaction_statuses.push(tx_status);
+                // Calculate dynamic check interval based on number of pending txs
+                let new_interval = match tx_hashes.len() {
+                    0..=10 => std::time::Duration::from_secs(2),
+                    11..=100 => std::time::Duration::from_secs(5),
+                    101..=500 => std::time::Duration::from_secs(10),
+                    _ => std::time::Duration::from_secs(15),
+                };
+                check_interval = tokio::time::interval(new_interval);
+                
+                // Process each tx to check status
+                let mut i = 0;
+                while i < tx_hashes.len() {
+                    let hash = &tx_hashes[i];
                     
-                    // Check if we've been waiting long enough
-                    if start_time.elapsed().as_secs() > total_wait_time {
-                        println!("Reached maximum wait time, stopping status processing");
+                    // Check transaction status
+                    match node_client_clone.check_transaction_status(hash).await {
+                        Ok(Some(block_number)) => {
+                            // Transaction confirmed
+                            println!("Transaction {} confirmed in block {}", hash, block_number);
+                            if let Err(e) = tx_sender.send((hash.clone(), TransactionStatus::Confirmed(block_number))).await {
+                                println!("Error sending confirmation: {}", e);
+                            }
+                            
+                            // Remove from list to check
+                            tx_hashes.swap_remove(i);
+                            tx_status.remove(hash);
+                            continue; // Don't increment i since we swapped
+                        },
+                        Ok(None) => {
+                            // Still pending
+                            i += 1;
+                        },
+                        Err(e) => {
+                            println!("Error checking tx {}: {}", hash, e);
+                            
+                            // After a certain number of errors, consider tx as failed
+                            let error_count = tx_status.entry(hash.clone()).or_insert(None);
+                            match error_count {
+                                Some(count) => {
+                                    let new_count = count + 1;
+                                    if new_count > 5 {
+                                        // Too many errors, mark as failed
+                                        if let Err(e) = tx_sender.send((hash.clone(), TransactionStatus::Error(format!("Failed after {} attempts: {}", new_count, e)))).await {
+                                            println!("Error sending tx error status: {}", e);
+                                        }
+                                        tx_hashes.swap_remove(i);
+                                        tx_status.remove(hash);
+                                        continue;
+                                    } else {
+                                        *error_count = Some(new_count);
+                                    }
+                                },
+                                None => {
+                                    *error_count = Some(1);
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                
+                // Check if channel is closed
+                if tx_sender.is_closed() {
+                    break;
+                }
+            }
+        });
+        
+        // Main transaction submission loop
+        while std::time::Instant::now() < end_time {
+            // Check if we have capacity for more transactions
+            if in_flight_count >= max_concurrent {
+                // Wait for status updates
+                match tokio::time::timeout(std::time::Duration::from_millis(100), tx_receiver.recv()).await {
+                    Ok(Some((tx_hash, status))) => {
+                        self.handle_tx_status(&tx_hash, status, &mut submitted_txs, 
+                                             &mut confirmed_txs, &mut errored_txs, &mut in_flight_count);
+                    },
+                    Ok(None) => {
+                        // Channel closed - should not happen
+                        println!("Status channel closed unexpectedly");
+                        break;
+                    },
+                    Err(_) => {
+                        // Timeout - continue to check if we should submit more
+                    }
+                }
+                continue;
+            }
+            
+            // Calculate sleep time to maintain TPS
+            let sleep_time = if self.target_tps > 0 {
+                let desired_interval = std::time::Duration::from_secs_f64(1.0 / self.target_tps as f64);
+                desired_interval
+            } else {
+                std::time::Duration::from_millis(0)
+            };
+            
+            // Submit a transaction
+            let account_idx = total_submitted % self.accounts.len();
+            let account = &self.accounts[account_idx];
+            
+            match self.submit_transaction(&account).await {
+                Ok(tx_hash) => {
+                    println!("Submitted transaction {}: {}", total_submitted + 1, tx_hash);
+                    submitted_txs.insert(tx_hash.clone(), std::time::Instant::now());
+                    in_flight_count += 1;
+                    total_submitted += 1;
+                    
+                    // Add to status checking task
+                    if let Err(e) = tx_sender.send((tx_hash, TransactionStatus::Submitted)).await {
+                        println!("Error adding tx to status checker: {}", e);
+                    }
+                },
+                Err(e) => {
+                    println!("Error submitting transaction: {}", e);
+                    
+                    // Try to reconnect if submission fails
+                    if reconnect_attempts < max_reconnect_attempts {
+                        println!("Attempting to reconnect to node ({}/{})", 
+                                reconnect_attempts + 1, max_reconnect_attempts);
+                        
+                        if let Err(e) = self.node_client.reconnect().await {
+                            println!("Failed to reconnect: {}", e);
+                        } else {
+                            println!("Successfully reconnected");
+                        }
+                        reconnect_attempts += 1;
+                        
+                        // Backoff a bit before retrying
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    } else {
+                        println!("Max reconnection attempts reached, stopping benchmark");
                         break;
                     }
                 }
-                
-                collected_stats
-            })
-        };
-        
-        // Main transaction submission loop
-        while transactions_submitted < total_transactions {
-            // Wait until it's time for the next transaction
-            let now = Instant::now();
-            if now < next_tx_time {
-                tokio::time::sleep(next_tx_time - now).await;
             }
             
-            // Check if we have too many in-flight transactions
-            while in_flight_count >= max_concurrent_submissions {
-                // Sleep a bit and check again to avoid busy-wait
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            // Print periodic status updates every 15 seconds
+            if last_status_time.elapsed() > std::time::Duration::from_secs(15) {
+                println!("Status: Submitted={}, Confirmed={}, Errors={}, In-flight={}",
+                    total_submitted, confirmed_txs.len(), errored_txs.len(), in_flight_count);
+                last_status_time = std::time::Instant::now();
             }
             
-            in_flight_count += 1;
-            transactions_submitted += 1;
+            // Sleep to maintain TPS
+            tokio::time::sleep(sleep_time).await;
             
-            // Periodically try to reconnect to maintain connection
-            if last_reconnect_time.elapsed().as_secs() >= self.connection_retry_interval {
-                println!("Performing periodic reconnection to node...");
-                match self.node_client.reconnect().await {
-                    Ok(_) => {
-                        println!("Successfully reconnected to node");
-                        self.error_count = 0;
-                        last_reconnect_time = Instant::now();
-                    },
-                    Err(e) => {
-                        println!("Failed to reconnect to node: {}", e);
-                        // Don't increment error count here, just log
-                    }
-                }
+            // Process any status updates
+            while let Ok(Some((tx_hash, status))) = tokio::time::timeout(
+                std::time::Duration::from_millis(0), 
+                tx_receiver.recv()
+            ).await {
+                self.handle_tx_status(&tx_hash, status, &mut submitted_txs, 
+                                     &mut confirmed_txs, &mut errored_txs, &mut in_flight_count);
             }
-            
-            // Check if we need to reconnect due to errors
-            if self.error_count >= self.reconnect_after_errors {
-                println!("Too many consecutive errors ({}), attempting to reconnect...", self.error_count);
-                match self.node_client.reconnect().await {
-                    Ok(_) => {
-                        println!("Successfully reconnected to node after errors");
-                        self.error_count = 0;
-                        last_reconnect_time = Instant::now();
-                    },
-                    Err(e) => {
-                        println!("Failed to reconnect to node after errors: {}", e);
-                        // Continue anyway, we'll try again after more errors
-                    }
-                }
-            }
-
-            // Select a random account and amount for this transaction
-            let account_idx = rand::thread_rng().gen_range(0..self.accounts.len());
-            let account = &self.accounts[account_idx];
-            let amount = if self.min_amount == self.max_amount {
-                self.min_amount
-            } else {
-                rand::thread_rng().gen_range(self.min_amount..self.max_amount)
-            };
-            
-            // Submit the transaction based on the specified type
-            let recipient = crate::client::transaction::generate_random_recipient();
-            println!("Submitting {} transaction to {} with amount {}", 
-                if self.use_real_transactions { "real" } else { "simulated" },
-                recipient,
-                amount);
-            
-            let tx_result = match self.tx_type {
-                TxType::Transfer => {
-                    if self.use_real_transactions {
-                        self.node_client.submit_real_transfer(
-                            account, 
-                            &recipient, 
-                            amount
-                        ).await
-                    } else {
-                        self.node_client.submit_transfer(
-                            &account.address, 
-                            &recipient, 
-                            amount
-                        ).await
-                    }
-                },
-                TxType::Erc20Transfer => {
-                    if self.use_real_transactions {
-                        self.node_client.submit_real_erc20_transfer(
-                            account,
-                            &recipient,
-                            amount
-                        ).await
-                    } else {
-                        self.node_client.submit_erc20_transfer(
-                            &account.address,
-                            &recipient,
-                            amount
-                        ).await
-                    }
-                },
-                TxType::ComplexContract => {
-                    if self.use_real_transactions {
-                        self.node_client.submit_real_complex_contract(
-                            account,
-                            amount
-                        ).await
-                    } else {
-                        self.node_client.submit_complex_contract(
-                            &account.address,
-                            amount
-                        ).await
-                    }
-                }
-            };
-            
-            // Process the result of the transaction submission
-            match tx_result {
-                Ok(tx_hash) => {
-                    println!("Transaction submitted successfully with hash: {}", tx_hash);
-                    // Send the initial transaction status through the channel
-                    let _ = tx_sender.send(TransactionStatus {
-                        tx_hash: tx_hash.clone(),
-                        block_number: None,
-                        status: "pending".to_string(),
-                    }).await;
-                    
-                    // Spawn a new task to check the transaction status periodically
-                    // Since we can't pass self into an async closure, we need to create a clone of the client
-                    let node_client_clone = self.node_client.clone();
-                    let tx_sender_clone = tx_sender.clone();
-                    let tx_hash_clone = tx_hash.clone();
-                    
-                    tokio::spawn(async move {
-                        let mut attempts = 0;
-                        let max_attempts = 60; // 60 attempts * 5 seconds = 300 seconds (5 minutes)
-                        
-                        loop {
-                            if attempts >= max_attempts {
-                                // Transaction status check timed out
-                                let _ = tx_sender_clone.send(TransactionStatus {
-                                    tx_hash: tx_hash_clone.clone(),
-                                    block_number: None,
-                                    status: "timeout".to_string(),
-                                }).await;
-                                break;
-                            }
-                            
-                            // Check the transaction status
-                            match node_client_clone.check_transaction_status(&tx_hash_clone).await {
-                                Ok(Some(block_number)) => {
-                                    // Transaction is confirmed
-                                    let _ = tx_sender_clone.send(TransactionStatus {
-                                        tx_hash: tx_hash_clone.clone(),
-                                        block_number: Some(block_number),
-                                        status: "confirmed".to_string(),
-                                    }).await;
-                                    break;
-                                },
-                                Ok(None) => {
-                                    // Transaction still pending, wait and check again
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                    attempts += 1;
-                                },
-                                Err(e) => {
-                                    println!("Error checking transaction status: {}", e);
-                                    // Wait and retry
-                                    tokio::time::sleep(Duration::from_secs(5)).await;
-                                    attempts += 1;
-                                }
-                            }
-                        }
-                    });
-                },
-                Err(e) => {
-                    println!("Failed to submit transaction: {}", e);
-                    self.error_count += 1;
-                    in_flight_count -= 1;
-                    transactions_failed += 1;
-                    
-                    // Record the failed submission
-                    let _ = tx_sender.send(TransactionStatus {
-                        tx_hash: "failed_to_submit".to_string(),
-                        block_number: None,
-                        status: format!("error: {}", e),
-                    }).await;
-                    
-                    // If there are too many consecutive errors, we might want to slow down
-                    if self.error_count >= self.reconnect_after_errors / 2 {
-                        println!("Experiencing errors, slowing down submission rate...");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                }
-            }
-            
-            // Print status update periodically
-            if last_status_print_time.elapsed().as_secs() >= 60 {  // Every minute
-                println!("Status: Submitted={}, Completed={}, Failed={}, In-flight={}",
-                    transactions_submitted, transactions_completed, transactions_failed, in_flight_count);
-                last_status_print_time = Instant::now();
-            }
-            
-            // Calculate time for next transaction
-            next_tx_time += tx_interval;
         }
         
-        println!("Finished submitting all {} transactions", transactions_submitted);
-
-        // Wait some time for ongoing transactions to complete
-        println!("Waiting for transaction statuses to be collected...");
-        tokio::time::sleep(Duration::from_secs(wait_after_completion)).await;
-
-        // Close the sender channel to signal the status collector to finish
-        drop(tx_sender);
-
-        // Wait for the status collector to finish and get the stats
-        match status_collector_handle.await {
-            Ok(stats) => {
-                println!("Benchmark completed");
-                println!("Total transactions submitted: {}", stats.transaction_statuses.len());
-                
-                // Count confirmed transactions
-                let confirmed_count = stats.transaction_statuses.iter()
-                    .filter(|s| s.status == "confirmed")
-                    .count();
-                println!("Confirmed transactions: {}", confirmed_count);
-                
-                // Count and display errors by type
-                let mut error_counts = std::collections::HashMap::new();
-                for status in &stats.transaction_statuses {
-                    if status.status.starts_with("error:") {
-                        *error_counts.entry(&status.status).or_insert(0) += 1;
-                    }
-                }
-                
-                println!("Error breakdown:");
-                for (error, count) in error_counts {
-                    println!("  {}: {}", error, count);
-                }
-                
-                Ok(stats)
-            },
-            Err(e) => {
-                println!("Error collecting transaction statuses: {}", e);
-                Ok(final_stats)
+        println!("Submission period completed, waiting for in-flight transactions to complete...");
+        
+        // After submission period, wait for in-flight transactions to complete
+        let wait_start = std::time::Instant::now();
+        
+        // Check for timed-out transactions
+        let mut timed_out = false;
+        while in_flight_count > 0 && !timed_out {
+            // Calculate remaining wait time
+            let elapsed = wait_start.elapsed();
+            if elapsed >= max_wait_time {
+                println!("Maximum wait time reached, finalizing benchmark");
+                timed_out = true;
+                break;
             }
+            
+            // Check for timed-out individual transactions
+            let current_time = std::time::Instant::now();
+            let mut timeout_txs = Vec::new();
+            
+            for (hash, submit_time) in &submitted_txs {
+                if current_time.duration_since(*submit_time) > timeout_per_tx {
+                    timeout_txs.push(hash.clone());
+                }
+            }
+            
+            for hash in timeout_txs {
+                println!("Transaction {} timed out", hash);
+                errored_txs.insert(hash.clone(), "Transaction timed out".to_string());
+                submitted_txs.remove(&hash);
+                in_flight_count -= 1;
+            }
+            
+            // Process status updates
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5), 
+                tx_receiver.recv()
+            ).await {
+                Ok(Some((tx_hash, status))) => {
+                    self.handle_tx_status(&tx_hash, status, &mut submitted_txs, 
+                                         &mut confirmed_txs, &mut errored_txs, &mut in_flight_count);
+                },
+                Ok(None) => {
+                    // Channel closed
+                    println!("Status channel closed");
+                    break;
+                },
+                Err(_) => {
+                    // Timeout - print progress
+                    println!("Waiting for {} transactions, elapsed: {:.2}s/{:.2}s", 
+                             in_flight_count, 
+                             elapsed.as_secs_f64(),
+                             max_wait_time.as_secs_f64());
+                }
+            }
+        }
+        
+        // Close the status channel and join the status checking task
+        drop(tx_sender);
+        if let Err(e) = check_status_handle.await {
+            println!("Error joining status checker task: {}", e);
+        }
+        
+        // Calculate statistics
+        let total_time_ms = start_time.elapsed().as_millis() as u64;
+        let actual_tps = if total_time_ms > 0 {
+            (total_submitted as f64 * 1000.0) / (total_time_ms as f64)
+        } else {
+            0.0
+        };
+        
+        // Calculate confirmation times
+        let mut confirmation_times = Vec::new();
+        let mut total_time = 0u64;
+        
+        for (hash, block_number) in &confirmed_txs {
+            if let Some(submit_time) = submitted_txs.get(hash) {
+                let conf_time = submit_time.elapsed().as_millis() as u64;
+                confirmation_times.push(conf_time);
+                total_time += conf_time;
+            }
+        }
+        
+        let avg_confirmation_time = if !confirmation_times.is_empty() {
+            total_time / confirmation_times.len() as u64
+        } else {
+            0
+        };
+        
+        // Sort confirmation times for percentile calculation
+        confirmation_times.sort();
+        
+        let p50 = if !confirmation_times.is_empty() {
+            confirmation_times[confirmation_times.len() / 2]
+        } else {
+            0
+        };
+        
+        let p90 = if !confirmation_times.is_empty() {
+            confirmation_times[(confirmation_times.len() * 9) / 10]
+        } else {
+            0
+        };
+        
+        let p99 = if !confirmation_times.is_empty() {
+            confirmation_times[(confirmation_times.len() * 99) / 100]
+        } else {
+            0
+        };
+        
+        // Create benchmark stats
+        let stats = BenchmarkStats {
+            total_transactions: total_submitted,
+            successful_transactions: confirmed_txs.len() as u32,
+            failed_transactions: errored_txs.len() as u32,
+            tps: actual_tps,
+            target_tps: self.target_tps as f64,
+            duration: self.duration,
+            avg_confirmation_time,
+            p50_confirmation_time: p50,
+            p90_confirmation_time: p90,
+            p99_confirmation_time: p99,
+            start_time: start_time.elapsed().as_secs(),
+            errors: errored_txs,
+            tx_type: self.tx_type,
+        };
+        
+        // Print summary
+        println!("\nBenchmark Summary:");
+        println!("------------------");
+        println!("Total Transactions: {}", stats.total_transactions);
+        println!("Successful Transactions: {} ({:.2}%)", 
+                 stats.successful_transactions,
+                 (stats.successful_transactions as f64 / stats.total_transactions as f64) * 100.0);
+        println!("Failed Transactions: {} ({:.2}%)", 
+                 stats.failed_transactions,
+                 (stats.failed_transactions as f64 / stats.total_transactions as f64) * 100.0);
+        println!("Actual TPS: {:.2}", stats.tps);
+        println!("Target TPS: {:.2}", stats.target_tps);
+        println!("Duration: {}s", stats.duration);
+        println!("Average Confirmation Time: {}ms", stats.avg_confirmation_time);
+        println!("P50 Confirmation Time: {}ms", stats.p50_confirmation_time);
+        println!("P90 Confirmation Time: {}ms", stats.p90_confirmation_time);
+        println!("P99 Confirmation Time: {}ms", stats.p99_confirmation_time);
+        
+        stats
+    }
+    
+    // Helper function to handle transaction status updates
+    fn handle_tx_status(
+        &self,
+        tx_hash: &str,
+        status: TransactionStatus,
+        submitted_txs: &mut HashMap<String, std::time::Instant>,
+        confirmed_txs: &mut HashMap<String, u32>,
+        errored_txs: &mut HashMap<String, String>,
+        in_flight_count: &mut usize,
+    ) {
+        match status {
+            TransactionStatus::Confirmed(block_number) => {
+                if submitted_txs.contains_key(tx_hash) {
+                    let submit_time = submitted_txs.remove(tx_hash).unwrap();
+                    let confirmation_time = submit_time.elapsed().as_millis();
+                    println!("Transaction {} confirmed in block {} (took {}ms)",
+                             tx_hash, block_number, confirmation_time);
+                    confirmed_txs.insert(tx_hash.to_string(), block_number);
+                    *in_flight_count -= 1;
+                }
+            },
+            TransactionStatus::Error(error) => {
+                if submitted_txs.contains_key(tx_hash) {
+                    println!("Transaction {} failed: {}", tx_hash, error);
+                    submitted_txs.remove(tx_hash);
+                    errored_txs.insert(tx_hash.to_string(), error);
+                    *in_flight_count -= 1;
+                }
+            },
+            TransactionStatus::Submitted => {
+                // Just tracking submission, no status change
+            },
         }
     }
 }

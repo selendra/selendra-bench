@@ -9,13 +9,25 @@ use std::{error::Error, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use hex;
 use serde_json;
+use serde_json::json;
+use log::{debug, error, info, warn};
+use tokio::time::{sleep};
 
 // Add the transaction module
 pub mod transaction;
 
 // Custom error type that can be sent between threads
 #[derive(Debug)]
-pub struct BenchError(String);
+pub enum BenchError {
+    ConnectionError(String),
+    RPCError(String),
+    SerializationError(String),
+    CommandError(String),
+    ParseError(String),
+    IOError(String),
+    TimeoutError(String),
+    NonceError(String),
+}
 
 impl std::fmt::Display for BenchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,9 +62,16 @@ impl From<Box<dyn Error + Send + Sync>> for BenchError {
     }
 }
 
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+const RECONNECT_DELAY_MS: u64 = 1000;
+const TX_STATUS_CHECK_INTERVAL_MS: u64 = 2000;
+const TX_STATUS_TIMEOUT_SECONDS: u64 = 120;
+
 #[derive(Clone)]
 pub struct NodeClient {
-    active_client: Arc<Mutex<WsClient>>,
+    pub client: Arc<WsClient>,
+    pub endpoint: String,
+    pub nonce: Arc<Mutex<u32>>,
     primary_url: String,
     backup_urls: Vec<String>,
     tx_script_dir: String,
@@ -150,7 +169,9 @@ impl NodeClient {
         }
         
         Ok(Self {
-            active_client: Arc::new(Mutex::new(client)),
+            client: Arc::new(client),
+            endpoint: primary_url,
+            nonce: Arc::new(Mutex::new(0)),
             primary_url,
             backup_urls,
             tx_script_dir: absolute_script_dir,
@@ -161,79 +182,207 @@ impl NodeClient {
         })
     }
     
-    // Method to reconnect to any available RPC endpoint
+    /// Attempts to reconnect to the node 
     pub async fn reconnect(&self) -> Result<(), BenchError> {
-        let mut urls = vec![self.primary_url.clone()];
-        urls.extend(self.backup_urls.clone());
+        info!("Attempting to reconnect to node at {}", self.endpoint);
         
-        let mut last_error = None;
-        
-        for url in urls {
-            match WsClientBuilder::default().build(&url).await {
-                Ok(client) => {
-                    println!("Successfully reconnected to URL: {}", url);
-                    let mut active_client = self.active_client.lock().await;
-                    *active_client = client;
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+            // Try to close existing connection gracefully
+            match Arc::get_mut(&mut self.client) {
+                Some(client) => {
+                    // Ignore errors during close, as connection might already be broken
+                    let _ = client.close().await;
+                },
+                None => {
+                    // Can't get exclusive access to client, likely due to other references
+                    // Create a new Arc instead
+                    debug!("Unable to get exclusive access to client for closing, creating new client");
+                }
+            }
+            
+            // Attempt to create a new connection
+            match WsClientBuilder::default().build(&self.endpoint).await {
+                Ok(new_client) => {
+                    self.client = Arc::new(new_client);
+                    info!("Successfully reconnected to node");
                     return Ok(());
                 },
                 Err(e) => {
-                    println!("Failed to reconnect to URL {}: {}", url, e);
-                    last_error = Some(e);
+                    warn!("Reconnection attempt {}/{} failed: {}", 
+                         attempt, MAX_RECONNECT_ATTEMPTS, e);
+                    
+                    if attempt < MAX_RECONNECT_ATTEMPTS {
+                        sleep(Duration::from_millis(RECONNECT_DELAY_MS)).await;
+                    }
                 }
             }
         }
         
-        Err(format!("Failed to reconnect to any RPC endpoint: {}", last_error.unwrap()).into())
+        Err(BenchError::ConnectionError(format!(
+            "Failed to reconnect after {} attempts", MAX_RECONNECT_ATTEMPTS
+        )))
     }
     
-    // Method to check if a transaction has been included in a block
+    /// Check transaction status with multiple fallback methods
     pub async fn check_transaction_status(&self, tx_hash: &str) -> Result<Option<u32>, BenchError> {
-        let params = rpc_params![tx_hash];
-        let client = self.active_client.lock().await;
+        // Try multiple methods to verify transaction status
         
-        match client.request::<serde_json::Value, _>("author_extrinsicStatus", params).await {
-            Ok(status) => {
-                // Parse the response to check if the transaction is in a block
-                if let Some(block_info) = status.get("inBlock") {
-                    if let Some(block_hash) = block_info.as_str() {
-                        // Get the block number from the block hash
-                        let params = rpc_params![block_hash];
-                        match client.request::<serde_json::Value, _>("chain_getBlock", params).await {
-                            Ok(block) => {
-                                if let Some(header) = block.get("block").and_then(|b| b.get("header")) {
-                                    if let Some(number) = header.get("number").and_then(|n| n.as_str()) {
-                                        // Convert hex block number to u32
-                                        if let Ok(number) = u32::from_str_radix(number.trim_start_matches("0x"), 16) {
-                                            return Ok(Some(number));
-                                        }
-                                    }
-                                }
-                                // If we couldn't parse the block number, return Some(0) to indicate it's in a block
-                                return Ok(Some(0));
-                            },
-                            Err(e) => {
-                                println!("Error getting block details: {}", e);
-                                // Return Some(0) to indicate it's in a block even if we couldn't get details
-                                return Ok(Some(0));
-                            }
+        // Method 1: Try author_extrinsicStatus (substrate style)
+        match self.check_tx_substrate_style(tx_hash).await {
+            Ok(Some(block_number)) => {
+                // Successfully found transaction
+                return Ok(Some(block_number));
+            }
+            Ok(None) => {
+                // Transaction not found with this method, try next method
+            }
+            Err(e) => {
+                // Log error but try other methods
+                debug!("Error checking transaction via substrate style: {}", e);
+            }
+        }
+        
+        // Method 2: Try ethereum style receipt check
+        match self.check_tx_ethereum_style(tx_hash).await {
+            Ok(Some(block_number)) => {
+                return Ok(Some(block_number));
+            }
+            Ok(None) => {
+                // Transaction not found with this method either, try next method
+            }
+            Err(e) => {
+                debug!("Error checking transaction via ethereum style: {}", e);
+            }
+        }
+        
+        // Method 3: Check if in mempool
+        match self.check_tx_in_mempool(tx_hash).await {
+            Ok(true) => {
+                // Transaction exists in mempool but not yet finalized
+                return Ok(None);
+            }
+            Ok(false) => {
+                // Transaction not found in mempool either
+                debug!("Transaction {} not found in any source", tx_hash);
+                return Ok(None);
+            }
+            Err(e) => {
+                debug!("Error checking transaction in mempool: {}", e);
+                // Fall through to return error
+            }
+        }
+        
+        // If all methods failed to find transaction, return None
+        debug!("All transaction status check methods failed for {}", tx_hash);
+        Ok(None)
+    }
+    
+    // Method 1: Check transaction using Substrate style RPC
+    async fn check_tx_substrate_style(&self, tx_hash: &str) -> Result<Option<u32>, BenchError> {
+        let params = json!([tx_hash]);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "author_extrinsicStatus",
+            "params": params,
+            "id": 1
+        });
+        
+        let response = self.client.request::<serde_json::Value>(request).await?;
+        
+        if let Some(result) = response.get("result") {
+            if let Some(status) = result.get("finalized") {
+                if let Some(block_hash) = status.as_str() {
+                    // Get block number from block hash
+                    return self.get_block_number_by_hash(block_hash).await;
+                }
+            }
+        }
+        
+        // Not finalized yet
+        Ok(None)
+    }
+    
+    // Method 2: Check transaction using Ethereum style RPC
+    async fn check_tx_ethereum_style(&self, tx_hash: &str) -> Result<Option<u32>, BenchError> {
+        let params = json!([tx_hash]);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionReceipt",
+            "params": params,
+            "id": 1
+        });
+        
+        let response = self.client.request::<serde_json::Value>(request).await?;
+        
+        if let Some(result) = response.get("result") {
+            if !result.is_null() {
+                // Transaction receipt exists
+                if let Some(block_number_hex) = result.get("blockNumber").and_then(|v| v.as_str()) {
+                    // Convert hex to number
+                    return self.get_block_number_by_hash(block_number_hex).await;
+                }
+            }
+        }
+        
+        // No receipt found
+        Ok(None)
+    }
+    
+    // Method 3: Check if transaction is in mempool
+    async fn check_tx_in_mempool(&self, tx_hash: &str) -> Result<bool, BenchError> {
+        let params = json!([tx_hash]);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionByHash",
+            "params": params,
+            "id": 1
+        });
+        
+        let response = self.client.request::<serde_json::Value>(request).await?;
+        
+        if let Some(result) = response.get("result") {
+            if !result.is_null() {
+                // Transaction exists in mempool or chain
+                return Ok(true);
+            }
+        }
+        
+        // Transaction not found
+        Ok(false)
+    }
+    
+    // Helper to get block number from hash
+    async fn get_block_number_by_hash(&self, block_hash: &str) -> Result<Option<u32>, BenchError> {
+        let params = json!([block_hash]);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "chain_getBlock",
+            "params": params,
+            "id": 1
+        });
+        
+        let response = self.client.request::<serde_json::Value>(request).await?;
+        
+        if let Some(result) = response.get("result") {
+            if let Some(block) = result.get("block") {
+                if let Some(header) = block.get("header") {
+                    if let Some(number_str) = header.get("number").and_then(|v| v.as_str()) {
+                        // Remove '0x' prefix if present and parse
+                        if let Ok(number) = parse_hex_to_u32(number_str) {
+                            return Ok(Some(number));
                         }
                     }
                 }
-                // Transaction is not in a block yet
-                Ok(None)
-            },
-            Err(e) => {
-                // If the error suggests the transaction is not found, it might still be pending
-                if e.to_string().contains("not found") || e.to_string().contains("Unknown") {
-                    return Ok(None);
-                }
-                Err(format!("Error checking transaction status: {}", e).into())
             }
         }
+        
+        Err(BenchError::ParseError(format!(
+            "Could not extract block number from response: {:?}", response
+        )))
     }
 
     pub async fn get_chain_metadata(&self) -> Result<ChainMetadata, BenchError> {
-        let client = self.active_client.lock().await;
+        let client = self.client.lock().await;
         
         // Get genesis hash
         let genesis_hash: String = match client.request("chain_getBlockHash", rpc_params![0]).await {
@@ -282,7 +431,7 @@ impl NodeClient {
 
     // Submit a transfer transaction
     pub async fn submit_transfer(&self, from: &str, to: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.active_client.lock().await;
+        let client = self.client.lock().await;
         
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
@@ -305,7 +454,7 @@ impl NodeClient {
     
     // Submit an ERC20 transfer transaction
     pub async fn submit_erc20_transfer(&self, from: &str, to: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.active_client.lock().await;
+        let client = self.client.lock().await;
         
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
@@ -328,7 +477,7 @@ impl NodeClient {
     
     // Submit a complex contract call transaction
     pub async fn submit_complex_contract(&self, from: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.active_client.lock().await;
+        let client = self.client.lock().await;
         
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
@@ -401,6 +550,13 @@ impl NodeClient {
         // Stub implementation - you would implement the real complex contract call here
         Err("Real complex contract calls not yet implemented".into())
     }
+}
+
+// Helper function to parse hex to u32
+fn parse_hex_to_u32(hex_str: &str) -> Result<u32, BenchError> {
+    let cleaned = hex_str.trim_start_matches("0x");
+    u32::from_str_radix(cleaned, 16)
+        .map_err(|e| BenchError::ParseError(format!("Failed to parse hex number: {}", e)))
 }
 
 // Generate a random recipient address for testing
