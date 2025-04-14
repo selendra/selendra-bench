@@ -9,7 +9,7 @@ use std::{
     sync::Arc, 
     time::{Duration, Instant}
 };
-use tokio::sync::{mpsc, Mutex, watch};
+use tokio::sync::{mpsc, Mutex};
 use hex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, error, info, warn};
@@ -89,9 +89,10 @@ impl BenchmarkRunner {
         // Channel for collecting transaction status updates
         let (tx_sender, mut tx_receiver) = mpsc::channel::<TransactionStatus>(1000);
         
-        // Channel for signaling benchmark completion
-        let (done_tx, done_rx) = watch::channel(false);
-        let done_rx_clone = done_rx.clone();
+        // Flag for signaling benchmark completion
+        let benchmark_done = Arc::new(AtomicBool::new(false));
+        let benchmark_done_for_collector = benchmark_done.clone();
+        let benchmark_done_for_submitter = benchmark_done.clone();
         
         // Start timestamp
         let start_time = Instant::now();
@@ -115,11 +116,28 @@ impl BenchmarkRunner {
         
         // Stats
         let stats = Arc::new(Mutex::new(BenchmarkStats::default()));
-        let stats_clone = stats.clone();
+        let stats_for_collector = stats.clone();
+        let stats_for_submitter = stats.clone();
         
         // In-flight transactions (tx_hash -> submission_time)
         let in_flight = Arc::new(Mutex::new(HashMap::new()));
-        let in_flight_clone = in_flight.clone();
+        let in_flight_for_submitter = in_flight.clone();
+        
+        // Clone node client for submitter
+        let node_client_for_submitter = self.node_client.clone();
+        
+        // Clone node client for status collector
+        let node_client_for_collector = self.node_client.clone();
+        
+        // Clone accounts for submitter
+        let accounts_for_submitter = self.accounts.clone();
+        let use_real_transactions = self.use_real_transactions;
+        let tx_type = self.tx_type.clone();
+        let min_amount = self.min_amount;
+        let max_amount = self.max_amount;
+        
+        // Prepare tx_sender for submitter
+        let tx_sender_for_submitter = tx_sender.clone();
         
         // Log process start
         info!(
@@ -146,7 +164,7 @@ impl BenchmarkRunner {
             
             loop {
                 // Check if benchmark is done
-                if *done_rx.borrow() {
+                if benchmark_done_for_collector.load(Ordering::SeqCst) {
                     // Check if we have pending transactions
                     if pending_tx_checks.is_empty() {
                         break;
@@ -157,7 +175,7 @@ impl BenchmarkRunner {
                         warn!("Maximum wait time reached, ending status collector");
                         
                         // Update stats for timed out transactions
-                        let mut stats_guard = stats.lock().await;
+                        let mut stats_guard = stats_for_collector.lock().await;
                         stats_guard.timeouts += pending_tx_checks.len() as u32;
                         
                         // Log the hashes of timed out transactions
@@ -186,7 +204,7 @@ impl BenchmarkRunner {
                             // Remove from pending checks
                             if pending_tx_checks.remove(&hash).is_some() {
                                 // Update stats
-                                let mut stats_guard = stats.lock().await;
+                                let mut stats_guard = stats_for_collector.lock().await;
                                 let submission_time = stats_guard.submitted_timestamps.get(&hash).cloned();
                                 
                                 if let Some(submit_time) = submission_time {
@@ -200,12 +218,12 @@ impl BenchmarkRunner {
                                 completed_count += 1;
                             }
                         },
-                        TransactionStatus::Failed { hash, error, timestamp } => {
+                        TransactionStatus::Failed { hash, error, timestamp: _ } => {
                             // Remove from pending checks
                             if pending_tx_checks.remove(&hash).is_some() {
                                 // Update stats
-                                let mut stats_guard = stats.lock().await;
-                                stats_guard.errors.push(error);
+                                let mut stats_guard = stats_for_collector.lock().await;
+                                stats_guard.errors.entry(error).and_modify(|count| *count += 1).or_insert(1);
                                 stats_guard.failed += 1;
                                 failed_count += 1;
                                 completed_count += 1;
@@ -215,7 +233,7 @@ impl BenchmarkRunner {
                             // Remove from pending checks
                             if pending_tx_checks.remove(&hash).is_some() {
                                 // Update stats
-                                let mut stats_guard = stats.lock().await;
+                                let mut stats_guard = stats_for_collector.lock().await;
                                 stats_guard.timeouts += 1;
                                 timeout_count += 1;
                                 completed_count += 1;
@@ -227,7 +245,7 @@ impl BenchmarkRunner {
                     },
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         // Sender has been dropped, exit after checking remaining transactions
-                        if *done_rx.borrow() && pending_tx_checks.is_empty() {
+                        if benchmark_done_for_collector.load(Ordering::SeqCst) && pending_tx_checks.is_empty() {
                             break;
                         }
                     },
@@ -252,14 +270,15 @@ impl BenchmarkRunner {
                     
                     // If transaction has been pending too long, mark as timeout
                     if time_since_submit > Duration::from_secs(5 * 60) {
-                        let mut stats_guard = stats.lock().await;
+                        let mut stats_guard = stats_for_collector.lock().await;
                         stats_guard.timeouts += 1;
                         timeout_count += 1;
                         completed_count += 1;
                         
-                        let sender = tx_sender.clone();
+                        let tx_sender_clone = tx_sender.clone();
+                        let hash_string = hash.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = sender.send(TransactionStatus::TimedOut { hash }).await {
+                            if let Err(e) = tx_sender_clone.send(TransactionStatus::TimedOut { hash: hash_string }).await {
                                 error!("Failed to send timeout status: {}", e);
                             }
                         });
@@ -271,7 +290,7 @@ impl BenchmarkRunner {
                     for hash in hash_batch {
                         // Clone necessary values for async block
                         let hash_clone = hash.clone();
-                        let client = self.node_client.clone();
+                        let client = node_client_for_collector.clone();
                         let tx_status_sender = tx_sender.clone();
                         
                         // Spawn status check task
@@ -348,7 +367,7 @@ impl BenchmarkRunner {
             
             while Instant::now() < target_end_time {
                 // Check number of in-flight transactions
-                let in_flight_count = in_flight_clone.lock().await.len();
+                let in_flight_count = in_flight_for_submitter.lock().await.len();
                 
                 if in_flight_count >= max_concurrent_submissions {
                     // Too many in-flight transactions, wait briefly before checking again
@@ -364,14 +383,22 @@ impl BenchmarkRunner {
                 
                 // Get account for transaction
                 // Use modulo to cycle through accounts
-                let account_idx = tx_count % self.accounts.len();
-                let account = &self.accounts[account_idx];
+                let account_idx = tx_count % accounts_for_submitter.len();
+                let account = &accounts_for_submitter[account_idx];
+                
+                // Generate random amount between min and max if needed
+                let amount = if min_amount == max_amount {
+                    min_amount
+                } else {
+                    let mut rng = rand::thread_rng();
+                    rng.gen_range(min_amount..=max_amount)
+                };
                 
                 // Submit transaction based on type
-                let tx_hash = match self.tx_type {
+                let tx_hash = match tx_type {
                     TxType::Transfer => {
                         // For transfer, we need a recipient
-                        let recipient = if self.use_real_transactions {
+                        let recipient = if use_real_transactions {
                             // With real transactions, use a predefined recipient
                             // Define a consistent recipient here or get from config
                             "0x8eaf04151687736326c9fea17e25fc5287613693".to_string()
@@ -380,32 +407,31 @@ impl BenchmarkRunner {
                             format!("0x{}", hex::encode([0u8; 20]))
                         };
                         
-                        self.node_client.submit_transfer(
+                        node_client_for_submitter.submit_transfer(
                             &account.address,
                             &recipient,
-                            "0x1000000000000000" // Fixed amount for testing
+                            amount
                         ).await
                     },
                     TxType::Erc20Transfer => {
                         // ERC20 transfer needs recipient and contract address
                         let recipient = "0x8eaf04151687736326c9fea17e25fc5287613693".to_string();
-                        let contract = "0xB8c77482e45F1F44dE1745F52C74426C631bDD52".to_string(); // Example contract
+                        let _contract = "0xB8c77482e45F1F44dE1745F52C74426C631bDD52".to_string(); // Example contract
                         
-                        self.node_client.submit_erc20_transfer(
+                        node_client_for_submitter.submit_erc20_transfer(
                             &account.address,
                             &recipient,
-                            "0x1000000000000000", // Fixed amount for testing
-                            &contract
+                            amount
                         ).await
                     },
                     TxType::ComplexContract => {
                         // Complex contract call
-                        let contract = "0xB8c77482e45F1F44dE1745F52C74426C631bDD52".to_string(); // Example contract
+                        let _contract = "0xB8c77482e45F1F44dE1745F52C74426C631bDD52".to_string(); // Example contract
                         let data = "0xa9059cbb0000000000000000000000008eaf04151687736326c9fea17e25fc52876136930000000000000000000000000000000000000000000000000000000000000001";
                         
-                        self.node_client.submit_complex_contract(
+                        node_client_for_submitter.submit_complex_contract(
                             &account.address,
-                            &contract,
+                            &_contract,
                             data
                         ).await
                     },
@@ -417,10 +443,10 @@ impl BenchmarkRunner {
                         let timestamp = Instant::now();
                         
                         // Add to in-flight transactions
-                        in_flight_clone.lock().await.insert(hash.clone(), timestamp);
+                        in_flight_for_submitter.lock().await.insert(hash.clone(), timestamp);
                         
                         // Update stats
-                        let mut stats_guard = stats_clone.lock().await;
+                        let mut stats_guard = stats_for_submitter.lock().await;
                         stats_guard.submitted += 1;
                         stats_guard.submitted_timestamps.insert(hash.clone(), timestamp);
                         
@@ -430,7 +456,7 @@ impl BenchmarkRunner {
                             timestamp,
                         };
                         
-                        if let Err(e) = tx_sender.send(status).await {
+                        if let Err(e) = tx_sender_for_submitter.send(status).await {
                             error!("Failed to send submission status: {}", e);
                         }
                         
@@ -441,8 +467,8 @@ impl BenchmarkRunner {
                     },
                     Err(e) => {
                         // Submission failed, update stats
-                        let mut stats_guard = stats_clone.lock().await;
-                        stats_guard.errors.push(format!("Submission error: {:?}", e));
+                        let mut stats_guard = stats_for_submitter.lock().await;
+                        stats_guard.errors.entry(format!("Submission error: {:?}", e)).and_modify(|count| *count += 1).or_insert(1);
                         stats_guard.failed += 1;
                         
                         // Log error
@@ -463,13 +489,13 @@ impl BenchmarkRunner {
             }
             
             // Signal benchmark completion
-            let _ = done_tx.send(true);
+            benchmark_done_for_submitter.store(true, Ordering::SeqCst);
             
             info!("Submission phase complete, submitted {} transactions", tx_count);
         });
         
         // Wait for benchmark duration plus a grace period for confirmations
-        let benchmark_completion_time = target_end_time + Duration::from_secs(30);
+        let _benchmark_completion_time = target_end_time + Duration::from_secs(30);
         let timeout_duration = Duration::from_secs((self.duration_seconds + 30).min(7200)); // Max 2 hours
         
         // Wait for benchmark to complete with timeout
@@ -482,7 +508,7 @@ impl BenchmarkRunner {
             Err(_) => {
                 error!("Submitter task timed out after {} seconds", timeout_duration.as_secs());
                 // Signal completion anyway to allow status collector to finish
-                let _ = done_rx_clone.send(true);
+                benchmark_done.store(true, Ordering::SeqCst);
             },
         }
         
@@ -500,7 +526,7 @@ impl BenchmarkRunner {
         }
         
         // Return final stats
-        let stats = stats_clone.lock().await.clone();
+        let stats = stats.lock().await.clone();
         
         // Log final results
         info!("Benchmark complete: {} submitted, {} confirmed, {} failed, {} timed out", 
@@ -524,7 +550,7 @@ fn generate_accounts(num: usize) -> Vec<Account> {
         .map(|_| {
             let mut private_key = vec![0u8; 32];
             rng.fill(&mut private_key[..]);
-            let address = format!("0x{}", hex::encode(&private_key));
+            let address = format!("0x{}", hex::encode(&private_key[0..20]));
             Account {
                 address,
                 private_key,

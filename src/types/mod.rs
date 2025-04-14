@@ -28,7 +28,15 @@ pub struct BenchmarkStats {
     pub errors: HashMap<String, usize>,
     #[serde(skip)]
     pub node_metrics: Vec<NodeMetrics>,
-    pub transaction_statuses: Vec<TransactionStatus>,
+    pub transaction_statuses: Vec<String>,
+    pub confirmed: usize,
+    pub timeouts: u32,
+    #[serde(skip)]
+    pub submitted_timestamps: HashMap<String, Instant>,
+    #[serde(skip)]
+    pub confirmation_times: Vec<Duration>,
+    #[serde(skip)]
+    pub confirmed_blocks: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,7 +77,7 @@ pub struct Account {
     pub nonce: Arc<Mutex<u32>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum TxType {
     Transfer,
     Erc20Transfer,
@@ -89,7 +97,7 @@ impl std::str::FromStr for TxType {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, Serialize)]
 pub struct ChainMetadata {
     pub genesis_hash: String,
     pub runtime_version: u32,
@@ -99,11 +107,25 @@ pub struct ChainMetadata {
     pub token_symbol: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TransactionStatus {
-    pub tx_hash: String,
-    pub block_number: Option<u32>,
-    pub status: String,
+#[derive(Debug, Clone)]
+pub enum TransactionStatus {
+    Submitted {
+        hash: String,
+        timestamp: Instant,
+    },
+    Confirmed {
+        hash: String,
+        block_number: u32,
+        timestamp: Instant,
+    },
+    Failed {
+        hash: String,
+        error: String,
+        timestamp: Instant,
+    },
+    TimedOut {
+        hash: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

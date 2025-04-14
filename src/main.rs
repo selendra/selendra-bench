@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         backup_url,
         num_accounts, 
         tx_type, 
-        target_tps, 
+        target_tps as u32, 
         duration,
         use_real_transactions,
         seed_phrase,

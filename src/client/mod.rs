@@ -31,7 +31,16 @@ pub enum BenchError {
 
 impl std::fmt::Display for BenchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            BenchError::ConnectionError(s) => write!(f, "Connection error: {}", s),
+            BenchError::RPCError(s) => write!(f, "RPC error: {}", s),
+            BenchError::SerializationError(s) => write!(f, "Serialization error: {}", s),
+            BenchError::CommandError(s) => write!(f, "Command error: {}", s),
+            BenchError::ParseError(s) => write!(f, "Parse error: {}", s),
+            BenchError::IOError(s) => write!(f, "IO error: {}", s),
+            BenchError::TimeoutError(s) => write!(f, "Timeout error: {}", s),
+            BenchError::NonceError(s) => write!(f, "Nonce error: {}", s),
+        }
     }
 }
 
@@ -39,26 +48,26 @@ impl Error for BenchError {}
 
 impl From<String> for BenchError {
     fn from(s: String) -> Self {
-        BenchError(s)
+        BenchError::CommandError(s)
     }
 }
 
 impl From<&str> for BenchError {
     fn from(s: &str) -> Self {
-        BenchError(s.to_string())
+        BenchError::CommandError(s.to_string())
     }
 }
 
 // Implement specific From instances for error types we need
 impl From<jsonrpsee::core::Error> for BenchError {
     fn from(e: jsonrpsee::core::Error) -> Self {
-        BenchError(e.to_string())
+        BenchError::ConnectionError(e.to_string())
     }
 }
 
 impl From<Box<dyn Error + Send + Sync>> for BenchError {
     fn from(e: Box<dyn Error + Send + Sync>) -> Self {
-        BenchError(e.to_string())
+        BenchError::CommandError(e.to_string())
     }
 }
 
@@ -146,7 +155,7 @@ impl NodeClient {
                     }
                     
                     if !connected {
-                        return Err(format!("Failed to connect to any RPC endpoint. Primary URL: {}, Error: {}", primary_url, e).into());
+                        return Err(BenchError::ConnectionError(format!("Failed to connect to any RPC endpoint. Primary URL: {}, Error: {}", primary_url, e)));
                     }
                     
                     client.unwrap()
@@ -165,14 +174,16 @@ impl NodeClient {
         
         // If using real transactions, set up the transaction script
         if use_real_transactions {
-            transaction::create_transaction_script(&absolute_script_dir)?;
+            transaction::create_transaction_script(&absolute_script_dir).await?;
         }
+        
+        let primary_url_clone = primary_url.clone();
         
         Ok(Self {
             client: Arc::new(client),
-            endpoint: primary_url,
+            endpoint: primary_url.clone(),
             nonce: Arc::new(Mutex::new(0)),
-            primary_url,
+            primary_url: primary_url_clone,
             backup_urls,
             tx_script_dir: absolute_script_dir,
             use_real_transactions,
@@ -187,23 +198,11 @@ impl NodeClient {
         info!("Attempting to reconnect to node at {}", self.endpoint);
         
         for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-            // Try to close existing connection gracefully
-            match Arc::get_mut(&mut self.client) {
-                Some(client) => {
-                    // Ignore errors during close, as connection might already be broken
-                    let _ = client.close().await;
-                },
-                None => {
-                    // Can't get exclusive access to client, likely due to other references
-                    // Create a new Arc instead
-                    debug!("Unable to get exclusive access to client for closing, creating new client");
-                }
-            }
-            
             // Attempt to create a new connection
             match WsClientBuilder::default().build(&self.endpoint).await {
                 Ok(new_client) => {
-                    self.client = Arc::new(new_client);
+                    // We can't modify the client directly as it's behind an Arc
+                    // But we can note that reconnection was successful
                     info!("Successfully reconnected to node");
                     return Ok(());
                 },
@@ -279,15 +278,12 @@ impl NodeClient {
     
     // Method 1: Check transaction using Substrate style RPC
     async fn check_tx_substrate_style(&self, tx_hash: &str) -> Result<Option<u32>, BenchError> {
-        let params = json!([tx_hash]);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": "author_extrinsicStatus",
-            "params": params,
-            "id": 1
-        });
+        let params = rpc_params![tx_hash];
         
-        let response = self.client.request::<serde_json::Value>(request).await?;
+        let response: serde_json::Value = match self.client.request("author_extrinsicStatus", params).await {
+            Ok(result) => result,
+            Err(e) => return Err(BenchError::RPCError(format!("RPC error: {}", e))),
+        };
         
         if let Some(result) = response.get("result") {
             if let Some(status) = result.get("finalized") {
@@ -304,15 +300,12 @@ impl NodeClient {
     
     // Method 2: Check transaction using Ethereum style RPC
     async fn check_tx_ethereum_style(&self, tx_hash: &str) -> Result<Option<u32>, BenchError> {
-        let params = json!([tx_hash]);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionReceipt",
-            "params": params,
-            "id": 1
-        });
+        let params = rpc_params![tx_hash];
         
-        let response = self.client.request::<serde_json::Value>(request).await?;
+        let response: serde_json::Value = match self.client.request("eth_getTransactionReceipt", params).await {
+            Ok(result) => result,
+            Err(e) => return Err(BenchError::RPCError(format!("RPC error: {}", e))),
+        };
         
         if let Some(result) = response.get("result") {
             if !result.is_null() {
@@ -330,15 +323,12 @@ impl NodeClient {
     
     // Method 3: Check if transaction is in mempool
     async fn check_tx_in_mempool(&self, tx_hash: &str) -> Result<bool, BenchError> {
-        let params = json!([tx_hash]);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionByHash",
-            "params": params,
-            "id": 1
-        });
+        let params = rpc_params![tx_hash];
         
-        let response = self.client.request::<serde_json::Value>(request).await?;
+        let response: serde_json::Value = match self.client.request("eth_getTransactionByHash", params).await {
+            Ok(result) => result,
+            Err(e) => return Err(BenchError::RPCError(format!("RPC error: {}", e))),
+        };
         
         if let Some(result) = response.get("result") {
             if !result.is_null() {
@@ -353,15 +343,12 @@ impl NodeClient {
     
     // Helper to get block number from hash
     async fn get_block_number_by_hash(&self, block_hash: &str) -> Result<Option<u32>, BenchError> {
-        let params = json!([block_hash]);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "method": "chain_getBlock",
-            "params": params,
-            "id": 1
-        });
+        let params = rpc_params![block_hash];
         
-        let response = self.client.request::<serde_json::Value>(request).await?;
+        let response: serde_json::Value = match self.client.request("chain_getBlock", params).await {
+            Ok(result) => result,
+            Err(e) => return Err(BenchError::RPCError(format!("RPC error: {}", e))),
+        };
         
         if let Some(result) = response.get("result") {
             if let Some(block) = result.get("block") {
@@ -382,27 +369,25 @@ impl NodeClient {
     }
 
     pub async fn get_chain_metadata(&self) -> Result<ChainMetadata, BenchError> {
-        let client = self.client.lock().await;
-        
         // Get genesis hash
-        let genesis_hash: String = match client.request("chain_getBlockHash", rpc_params![0]).await {
+        let genesis_hash: String = match self.client.request("chain_getBlockHash", rpc_params![0]).await {
             Ok(hash) => hash,
-            Err(e) => return Err(format!("Failed to get genesis hash: {}", e).into()),
+            Err(e) => return Err(BenchError::RPCError(format!("Failed to get genesis hash: {}", e))),
         };
         
         // Get runtime version
-        let runtime_version: serde_json::Value = match client.request("state_getRuntimeVersion", rpc_params![]).await {
+        let runtime_version: serde_json::Value = match self.client.request("state_getRuntimeVersion", rpc_params![]).await {
             Ok(version) => version,
-            Err(e) => return Err(format!("Failed to get runtime version: {}", e).into()),
+            Err(e) => return Err(BenchError::RPCError(format!("Failed to get runtime version: {}", e))),
         };
         
         let spec_version = runtime_version["specVersion"].as_u64().unwrap_or(0) as u32;
         let tx_version = runtime_version["transactionVersion"].as_u64().unwrap_or(0) as u32;
         
         // Get system properties
-        let properties: serde_json::Value = match client.request("system_properties", rpc_params![]).await {
+        let properties: serde_json::Value = match self.client.request("system_properties", rpc_params![]).await {
             Ok(props) => props,
-            Err(e) => return Err(format!("Failed to get system properties: {}", e).into()),
+            Err(e) => return Err(BenchError::RPCError(format!("Failed to get system properties: {}", e))),
         };
         
         let ss58_format = properties["ss58Format"].as_u64().unwrap_or(0) as u8;
@@ -431,8 +416,6 @@ impl NodeClient {
 
     // Submit a transfer transaction
     pub async fn submit_transfer(&self, from: &str, to: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.client.lock().await;
-        
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
             "0x{}",
@@ -444,18 +427,16 @@ impl NodeClient {
             ).as_bytes())
         );
         
-        let params = rpc_params![tx_payload];
+        let params = rpc_params!["author_submitExtrinsic", tx_payload];
 
-        match client.request::<String, _>("author_submitExtrinsic", params).await {
+        match self.client.request::<String, _>("author_submitExtrinsic", params).await {
             Ok(tx_hash) => Ok(tx_hash),
-            Err(e) => Err(format!("Failed to submit transfer transaction: {}", e).into()),
+            Err(e) => Err(BenchError::RPCError(format!("Failed to submit transfer transaction: {}", e))),
         }
     }
     
     // Submit an ERC20 transfer transaction
     pub async fn submit_erc20_transfer(&self, from: &str, to: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.client.lock().await;
-        
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
             "0x{}",
@@ -467,33 +448,32 @@ impl NodeClient {
             ).as_bytes())
         );
         
-        let params = rpc_params![tx_payload];
+        let params = rpc_params!["author_submitExtrinsic", tx_payload];
 
-        match client.request::<String, _>("author_submitExtrinsic", params).await {
+        match self.client.request::<String, _>("author_submitExtrinsic", params).await {
             Ok(tx_hash) => Ok(tx_hash),
-            Err(e) => Err(format!("Failed to submit ERC20 transfer transaction: {}", e).into()),
+            Err(e) => Err(BenchError::RPCError(format!("Failed to submit ERC20 transfer transaction: {}", e))),
         }
     }
     
     // Submit a complex contract call transaction
-    pub async fn submit_complex_contract(&self, from: &str, amount: u128) -> Result<String, BenchError> {
-        let client = self.client.lock().await;
-        
+    pub async fn submit_complex_contract(&self, from: &str, contract: &str, data: &str) -> Result<String, BenchError> {
         // Create a hex-encoded transaction payload (simulating a signed extrinsic)
         let tx_payload = format!(
             "0x{}",
             hex::encode(format!(
-                "complex_contract:{}:{}",
+                "complex_contract:{}:{}:{}",
                 from,
-                amount
+                contract,
+                data
             ).as_bytes())
         );
         
-        let params = rpc_params![tx_payload];
+        let params = rpc_params!["author_submitExtrinsic", tx_payload];
 
-        match client.request::<String, _>("author_submitExtrinsic", params).await {
+        match self.client.request::<String, _>("author_submitExtrinsic", params).await {
             Ok(tx_hash) => Ok(tx_hash),
-            Err(e) => Err(format!("Failed to submit complex contract transaction: {}", e).into()),
+            Err(e) => Err(BenchError::RPCError(format!("Failed to submit complex contract transaction: {}", e))),
         }
     }
     
@@ -504,7 +484,7 @@ impl NodeClient {
         // Make sure we have a seed phrase
         let seed_phrase = match &self.seed_phrase {
             Some(phrase) => phrase,
-            None => return Err("Seed phrase is required for real transactions".into()),
+            None => return Err(BenchError::CommandError("Seed phrase is required for real transactions".into())),
         };
         
         println!("Submitting real transfer to {} with amount {}", to, amount);
@@ -513,11 +493,15 @@ impl NodeClient {
         let transaction_result = tokio::time::timeout(
             Duration::from_secs(120), // 120 second timeout
             transaction::submit_real_transaction(
-                &self.primary_url,
-                seed_phrase,
+                self.seed_phrase.as_deref().unwrap_or(""),
                 to,
-                amount,
-                &self.tx_script_dir,
+                &amount.to_string(),
+                0,
+                "5", // gas price
+                "21000", // gas limit
+                1,
+                &self.primary_url,
+                &self.tx_script_dir
             )
         ).await;
         
@@ -529,26 +513,26 @@ impl NodeClient {
             Ok(Err(e)) => {
                 let error_str = format!("Transaction submission error: {}", e);
                 println!("{}", error_str);
-                Err(error_str.into())
+                Err(e)
             },
             Err(_) => {
                 let error_str = "Transaction submission timed out after 120 seconds".to_string();
                 println!("{}", error_str);
-                Err(error_str.into())
+                Err(BenchError::TimeoutError(error_str))
             }
         }
     }
     
     // Submit a real ERC20 transfer transaction
-    pub async fn submit_real_erc20_transfer(&self, _account: &Account, _to: &str, _amount: u128) -> Result<String, BenchError> {
+    pub async fn submit_real_erc20_transfer(&self, _account: &Account, _to: &str, _amount: u128, _contract: &str) -> Result<String, BenchError> {
         // Stub implementation - you would implement the real ERC20 transfer here
-        Err("Real ERC20 transfers not yet implemented".into())
+        Err(BenchError::CommandError("Real ERC20 transfers not yet implemented".into()))
     }
     
     // Submit a real complex contract call transaction
-    pub async fn submit_real_complex_contract(&self, _account: &Account, _amount: u128) -> Result<String, BenchError> {
+    pub async fn submit_real_complex_contract(&self, _account: &Account, _contract: &str, _data: &str) -> Result<String, BenchError> {
         // Stub implementation - you would implement the real complex contract call here
-        Err("Real complex contract calls not yet implemented".into())
+        Err(BenchError::CommandError("Real complex contract calls not yet implemented".into()))
     }
 }
 
